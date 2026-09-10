@@ -27,7 +27,7 @@ from sentence_transformers import SentenceTransformer, util
 from keybert import KeyBERT
 from collections import Counter, defaultdict
 from scipy.stats import gaussian_kde, entropy
-from scipy.spatial.distance import pdist
+from scipy.spatial.distance import pdist, squareform
 from sklearn.metrics.pairwise import cosine_similarity
 import os
 import tempfile
@@ -528,6 +528,37 @@ def calculate_embedding_dispersion(abstracts: list[str]) -> dict:
             "embeddings": embeddings_np}
 
 
+def paper_field_counts(paper: dict, reference_topics: dict) -> tuple[dict, dict, dict]:
+    """One paper's reference fields, audience fields, and the domains seen."""
+    refs, domains = defaultdict(int), {}
+    for ref_id in paper.get("referenced_works", []):
+        topic = reference_topics.get(ref_id)
+        field = field_of(topic)
+        if field:
+            refs[field] += 1
+            domain = domain_of(topic)
+            if domain:
+                domains.setdefault(field, domain)
+    audience = defaultdict(int)
+    for citing in paper.get("citing", []):
+        field = field_of(citing.get("topic"))
+        if field:
+            audience[field] += 1
+    return dict(refs), dict(audience), domains
+
+
+def per_paper_internal(abstracts: list[str]) -> list[float]:
+    """Each paper's mean cosine distance to the other analysed papers, 0-100."""
+    if len(abstracts) < 2:
+        return [0.0] * len(abstracts)
+    with torch.no_grad():
+        emb = sentence_model.encode(abstracts, convert_to_tensor=True, device=Config.DEVICE)
+        emb = emb.cpu().numpy()
+    d = squareform(pdist(emb, metric="cosine"))
+    n = len(abstracts)
+    return [float(min(100.0, d[i].sum() / (n - 1) * 100)) for i in range(n)]
+
+
 def calculate_reference_diversity(papers: list[dict], reference_topics: dict) -> dict:
     """How widely the author's reference lists spread across fields.
 
@@ -1018,9 +1049,23 @@ body { background:var(--paper); color:var(--ink); font-family:var(--sans);
 .track-index .track-val { color:var(--cool); font-weight:700; font-size:26px; }
 .track-val { font-family:var(--mono); font-size:22px; font-weight:500; text-align:right;
              font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
-.profile-foot { display:flex; gap:24px; flex-wrap:wrap; padding-top:17px; margin-top:8px;
-                border-top:1px solid var(--rule-soft); font-size:12.5px; color:var(--ink-3); }
-.profile-foot b { font-family:var(--mono); font-weight:500; color:var(--ink-2); }
+.profile-foot { display:grid; gap:10px; margin-top:22px; padding-top:22px; border-top:1px solid var(--rule); }
+.foot-group { background:var(--paper); border:1px solid var(--rule); border-radius:8px; padding:16px 18px 15px; }
+.foot-group-head { margin-bottom:14px; padding-bottom:10px; border-bottom:1px solid var(--rule); }
+.foot-group-title { display:block; font-size:11.5px; font-weight:600; letter-spacing:.1em; text-transform:uppercase;
+                    color:var(--ink); margin-bottom:3px; }
+.foot-group-lead { font-size:12.5px; color:var(--ink-3); }
+.foot-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:14px 22px; }
+.fact-text .fact-value { font-family:var(--sans); font-size:16px; }
+.fact-line { line-height:1.35; }
+.fact-more { color:var(--ink-3); font-size:13px; }
+.fact-share { font-family:var(--mono); font-size:12.5px; color:var(--ink-3); margin-left:6px; }
+.fact-wide { grid-column:span 2; }
+.fact-label { font-size:12px; color:var(--ink-3); margin-bottom:3px; }
+.fact-value { font-family:var(--mono); font-size:18px; font-weight:500; font-variant-numeric:tabular-nums;
+              letter-spacing:-.01em; line-height:1.25; }
+.fact-note { font-size:11.5px; line-height:1.45; color:var(--ink-3); margin-top:4px; }
+.foot-note { font-size:11.5px; color:var(--ink-3); letter-spacing:0; }
 .section-label { font-size:12px; font-weight:500; letter-spacing:.1em; text-transform:uppercase;
                  color:var(--ink-3); margin:34px 0 10px; }
 .chart-container { background:var(--surface); border:1px solid var(--rule); border-radius:10px;
@@ -1242,11 +1287,17 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
         # so a worker thread genuinely gives the loop back.
         avg_sim, idx_val, count, sims = await asyncio.to_thread(
             calculate_similarity_and_index, abs_orig, citing_texts)
+        # The same two field measures, for this paper alone, so the table
+        # can be ranked by each. Single-paper reference lists are short, so
+        # these are rougher than the author-level figures above them.
+        p_refs, p_aud, p_domains = paper_field_counts(paper, reference_topics)
         results.append({
             "title": paper["title"],
             "doi": paper.get("doi"),
             "year": paper["year"],
             "paper_index": idx_val * 100,
+            "paper_reference": diversity_of(p_refs, p_domains)["diversity_index"],
+            "paper_bridge": calculate_bridge_score(p_refs, p_aud)["bridge_score"],
             "citation_count": paper.get("citation_count", 0),
             "abstract": abs_orig,
         })
@@ -1259,6 +1310,16 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
             "an abstract, so external diversity cannot be computed. Well-cited work published some "
             "years ago gives the most reliable reading."
         )
+
+    for row, val in zip(results, await asyncio.to_thread(
+            per_paper_internal, [r["abstract"] for r in results])):
+        row["paper_internal"] = val
+        row["paper_composite"] = composite_score({
+            "citation_index": row["paper_index"],
+            "dispersion_score": val,
+            "reference_diversity": row["paper_reference"],
+            "bridge_score": row["paper_bridge"],
+        })["composite"]
 
     # ---- Reference and bridge diversity, from the same cached records ----
     step(0.62, "Measuring the spread of the reference lists")
@@ -1316,7 +1377,8 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
     keyword_chart = create_keywords_chart(Counter(all_keywords).most_common(10))
 
     df_top_papers = papers_table_html(
-        df[["title", "doi", "year", "paper_index", "citation_count"]].to_dict("records"))
+        df[["title", "doi", "year", "paper_index", "paper_internal", "paper_reference",
+            "paper_bridge", "paper_composite", "citation_count"]].to_dict("records"))
 
     df_report = df.rename(columns={"title": "Title", "year": "Year", "paper_index": "Index (%)"})
     html_path = generate_html_report(author_name, df_report, all_metrics, composite, scatter, kde_fig, dispersion_chart, ref_diversity_chart, bridge_chart, field_breakdown_chart, keyword_chart)
@@ -1327,21 +1389,6 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
     coverage = min(ref_diversity["coverage"], audience_coverage)
     retrieved = get_cache_timestamp(author_id, cache_dir)
     retrieved_str = retrieved.strftime("%Y-%m-%d %H:%M") if retrieved else "just now"
-
-    # The effective paper count varies by author — OpenAlex may hold fewer works
-    # with an abstract and a DOI than were asked for — and the bridge score
-    # depends on it, so the shortfall is stated rather than left to be inferred.
-    missing = requested - len(results)
-    shortfall = ""
-    if missing > 0:
-        reasons = []
-        if excluded_count:
-            reasons.append(f"{excluded_count} excluded by you")
-        if uncited:
-            reasons.append(f"{len(uncited)} not cited yet")
-        reason = ", ".join(reasons) or "OpenAlex holds no more with an abstract and a DOI"
-        shortfall = (f" <span class=\"foot-note\">of {requested}"
-                     f" &mdash; {reason}</span>")
 
     results_html = f"""
     <div class="profile">
@@ -1354,17 +1401,10 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
       {render_track("Reference diversity", ref_diversity['diversity_index'])}
       {render_track("Bridge", bridge_data['bridge_score'])}
       {render_track("Fieldtrip Index", composite, index=True)}
-      <div class="profile-foot">
-        <span>Range <b>{axes['range']:.0f}</b></span>
-        <span>Reach <b>{axes['reach']:.0f}</b></span>
-        <span>Papers analysed <b>{len(results)}</b>{shortfall}</span>
-        <span>Topic spread over <b>{len(spread_abstracts)}</b></span>
-        <span>Citing works <b>{n_citing}</b></span>
-        <span>References <b>{n_refs}</b></span>
-        <span>Effectively <b>{ref_diversity['effective_fields']:.1f}</b> fields</span>
-        <span>Bridged <b>{', '.join(bridge_data['bridged_fields'][:3]) or 'none'}</b></span>
-        <span>Classified <b>{coverage:.0%}</b></span>
-      </div>
+      {render_profile_foot(axes, composite, len(results), requested, len(uncited),
+                           excluded_count, n_citing, n_refs, coverage,
+                           ref_diversity['field_counts'], bridge_data['audience_fields'],
+                           bridge_data['bridged_fields'], bridge_data.get('imbalance', {}))}
     </div>
     """
 
@@ -1484,12 +1524,28 @@ async def analyse_for_comparison(picked: list[dict], cache_dir: str = None,
     return entries, problems
 
 
+PAPER_COLUMNS = [
+    ("year", "Year", "Year", "{}"),
+    ("paper_index", "External", "External<br>diversity", "{:.0f}"),
+    ("paper_internal", "Internal", "Internal<br>diversity", "{:.0f}"),
+    ("paper_reference", "Reference", "Reference<br>diversity", "{:.0f}"),
+    ("paper_bridge", "Bridge", "Bridge", "{:.0f}"),
+    ("paper_composite", "Fieldtrip", "Fieldtrip<br>Index", "{:.0f}"),
+    ("citation_count", "Cited by", "Cited by", "{:,}"),
+]
+
+
 def papers_table_html(rows: list[dict]) -> str:
-    """The analysed papers as an HTML table.
+    """The analysed papers as an HTML table, rankable by any column.
 
     Gradio's dataframe truncates its headers rather than wrapping them, which
     turned "External diversity" into "E…" in a narrow pane. Rendering the table
     directly keeps the headers legible and lets the titles be real links.
+
+    Ranking is done in the browser by the small script in PAGE_HEAD, which
+    listens for clicks on any ``th[data-sort]`` and reorders the rows by their
+    ``data-v`` values. That keeps re-ranking off the server and out of the
+    handler wiring entirely.
     """
     if not rows:
         return ""
@@ -1497,18 +1553,24 @@ def papers_table_html(rows: list[dict]) -> str:
     for i, r in enumerate(rows, 1):
         title = r["title"]
         cell = f'<a href="{r["doi"]}" target="_blank" rel="noopener">{title}</a>' if r.get("doi") else title
-        body.append(
-            f'<tr><td class="rank">{i:02d}</td><td class="title">{cell}</td>'
-            f'<td class="num" data-label="Year">{r["year"]}</td>'
-            f'<td class="num" data-label="External">{r["paper_index"]:.0f}</td>'
-            f'<td class="num" data-label="Cited by">{r["citation_count"]:,}</td></tr>'
-        )
+        cells = "".join(
+            f'<td class="num{" index" if key == "paper_composite" else ""}" '
+            f'data-label="{short}" data-v="{r[key]}">{fmt.format(r[key])}</td>'
+            for key, short, _, fmt in PAPER_COLUMNS)
+        body.append(f'<tr><td class="rank">{i:02d}</td><td class="title">{cell}</td>{cells}</tr>')
+    heads = "".join(
+        f'<th class="c-num{" sorted desc" if key == "paper_index" else ""}'
+        f'{" index" if key == "paper_composite" else ""}" data-sort="{key}" '
+        f'title="Rank by {short.lower()}">{label}</th>'
+        for key, short, label, _ in PAPER_COLUMNS)
     return (
-        '<div class="section-label">Papers analysed, ranked by external diversity</div>'
-        '<div class="table-card"><table class="data-table"><thead><tr>'
-        '<th class="c-rank"></th><th>Paper</th>'
-        '<th class="c-num">Year</th><th class="c-num">External<br>diversity</th>'
-        '<th class="c-num">Cited by</th>'
+        '<div class="section-label">Papers analysed'
+        '<span class="section-hint">Click a column heading to rank by it. Each row is '
+        'scored on its own: its own reference list, its own citers. Bridge and reference '
+        'diversity therefore do not average to the profile above, which pools all 25 '
+        'papers first.</span></div>'
+        '<div class="table-card"><table class="data-table sortable"><thead><tr>'
+        f'<th class="c-rank"></th><th>Paper</th>{heads}'
         '</tr></thead><tbody>' + "".join(body) + '</tbody></table></div>'
     )
 
@@ -1519,6 +1581,100 @@ MEASURE_LABELS = [
     ("reference_diversity", "reference diversity", "how widely they read"),
     ("bridge_score", "bridge", "how much of their audience their own reading does not explain"),
 ]
+
+def render_profile_foot(axes, composite, n_papers, requested, n_uncited, excluded_count,
+                        n_citing, n_refs, coverage, reference_fields, audience_fields,
+                        bridged_fields, imbalance):
+    """The strip under the profile, in three titled groups.
+
+    Only facts a non-specialist can read without the method: the two axes the
+    index is built from, the fields the work actually sits in, and the counts
+    everything rests on. Derived statistics such as the effective number of
+    fields were tried here and dropped as too vague for a first-time reader.
+    """
+    def fact(label, value, note, cls=""):
+        return (f'<div class="fact {cls}"><div class="fact-label">{label}</div>'
+                f'<div class="fact-value">{value}</div>'
+                f'<div class="fact-note">{note}</div></div>')
+
+    def group(title, lead, facts):
+        return (f'<div class="foot-group"><div class="foot-group-head">'
+                f'<span class="foot-group-title">{title}</span>'
+                f'<span class="foot-group-lead">{lead}</span></div>'
+                f'<div class="foot-grid">{"".join(facts)}</div></div>')
+
+    def top_shares(counts, k=3):
+        total = sum(counts.values())
+        if not total:
+            return "none classified"
+        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:k]
+        return "".join(f'<div class="fact-line">{f}'
+                       f'<span class="fact-share">{c / total:.0%}</span></div>' for f, c in top)
+
+    # The score sums every positive gap; the list names only gaps of at least
+    # BRIDGE_MIN_SHARE, so a score made of many small gaps has nothing to name.
+    small = [f for f, v in imbalance.items() if 0 < v < Config.BRIDGE_MIN_SHARE]
+    bridged = "".join(f'<div class="fact-line">{f}</div>' for f in bridged_fields[:3])
+    if len(bridged_fields) > 3:
+        bridged += f'<div class="fact-line fact-more">+{len(bridged_fields) - 3} more</div>'
+    if not bridged_fields:
+        bridged = ('<div class="fact-line fact-more">none above '
+                   f'{Config.BRIDGE_MIN_SHARE:.0%}</div>')
+    pct = f"{Config.BRIDGE_MIN_SHARE:.0%}"
+    bridge_note = (f"Fields that cite the work at least {pct} more than it cites them. "
+                   "Every positive gap counts towards the bridge score")
+    bridge_note += (f", including {len(small)} smaller field{'s' if len(small) != 1 else ''} "
+                    "not listed here." if small else ".")
+
+    axes_group = group(
+        "How the index is built",
+        f"Fieldtrip Index {composite:.0f} is the geometric mean of the two, "
+        "so neither side can carry it alone.",
+        [fact("Range", f"{axes['range']:.0f}",
+              "How varied the researcher\u2019s own work is: the average of internal "
+              "and reference diversity."),
+         fact("Reach", f"{axes['reach']:.0f}",
+              "How far the work travels: the average of external diversity and bridge.")])
+
+    fields_group = group(
+        "Where the work sits", "Fields as OpenAlex labels them.",
+        [fact("Draws on", top_shares(reference_fields),
+              "Fields of the works these papers cite.", cls="fact-text"),
+         fact("Cited by", top_shares(audience_fields),
+              "Fields of the works citing these papers.", cls="fact-text"),
+         fact("Reaches beyond its reading", bridged, bridge_note, cls="fact-text")])
+
+    # Papers: state the shortfall against what was asked for, and whether
+    # uncited papers were carried along for internal diversity only.
+    paper_note = "The most-cited papers with an abstract and a DOI."
+    missing = requested - n_papers
+    if missing > 0:
+        reasons = []
+        if excluded_count:
+            reasons.append(f"{excluded_count} excluded by you")
+        if n_uncited:
+            reasons.append(f"{n_uncited} not cited yet")
+        reason = ", ".join(reasons) or "OpenAlex holds no more with an abstract and a DOI"
+        paper_note += f" {requested} were asked for: {reason}."
+    if n_uncited:
+        paper_note += (f" The {n_uncited} uncited still count towards internal "
+                       "diversity, which needs no citing work.")
+
+    sample_group = group(
+        "What was counted", "Every measure rests on these. Small counts make the "
+        "scores above noisier.",
+        [fact("Papers analysed", f"{n_papers}", paper_note),
+         fact("Citing works", f"{n_citing}",
+              "A random sample of the works citing those papers, with "
+              "self-citations removed."),
+         fact("References", f"{n_refs}",
+              "Everything those papers cite."),
+         fact("With a field label", f"{coverage:.0%}",
+              "Share of references and citing works OpenAlex assigns a field. "
+              "The rest are left out of the field measures.")])
+
+    return f'<div class="profile-foot">{axes_group}{fields_group}{sample_group}</div>'
+
 
 def composite_score(metrics: dict) -> dict:
     """Range, reach, and their geometric mean.
@@ -1712,6 +1868,27 @@ PAGE_HEAD = f"""
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script>
+// Rank the papers table by a clicked heading. Delegated from the document so
+// it survives Gradio re-rendering the table on every analysis.
+document.addEventListener("click", function (ev) {{
+  const th = ev.target.closest("table.sortable th[data-sort]");
+  if (!th) return;
+  const table = th.closest("table");
+  const idx = Array.from(th.parentNode.children).indexOf(th);
+  const desc = !(th.classList.contains("sorted") && th.classList.contains("desc"));
+  table.querySelectorAll("th").forEach(h => h.classList.remove("sorted", "desc"));
+  th.classList.add("sorted");
+  if (desc) th.classList.add("desc");
+  const body = table.tBodies[0];
+  const rows = Array.from(body.rows);
+  rows.sort((a, b) => {{
+    const va = parseFloat(a.cells[idx].dataset.v), vb = parseFloat(b.cells[idx].dataset.v);
+    return desc ? vb - va : va - vb;
+  }});
+  rows.forEach((r, i) => {{ r.cells[0].textContent = String(i + 1).padStart(2, "0"); body.appendChild(r); }});
+}});
+</script>
 """
 
 custom_css = """
@@ -1842,12 +2019,31 @@ custom_css = """
     font-family: var(--mono); font-size: 22px; font-weight: 500; text-align: right;
     font-variant-numeric: tabular-nums; letter-spacing: -0.02em; color: var(--ink);
 }
-.profile-foot {
-    display: flex; gap: 24px; flex-wrap: wrap; padding-top: 17px; margin-top: 8px;
-    border-top: 1px solid var(--rule-soft); font-size: 12.5px; color: var(--ink-3);
+.profile-foot { display: grid; gap: 10px; margin-top: 22px; padding-top: 22px; border-top: 1px solid var(--rule); }
+.foot-group {
+    background: var(--paper); border: 1px solid var(--rule); border-radius: 8px;
+    padding: 16px 18px 15px;
 }
-.profile-foot b { font-family: var(--mono); font-weight: 500; color: var(--ink-2); }
-.profile-foot .foot-note { color: var(--ink-3); }
+.foot-group-head { margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--rule); }
+.foot-group-title {
+    display: block; font-size: 11.5px; font-weight: 600; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--ink); margin-bottom: 3px;
+}
+.foot-group-lead { font-size: 12.5px; color: var(--ink-3); }
+.foot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px 22px; }
+.fact-text .fact-value { font-family: var(--sans); font-size: 16px; }
+.fact-line { line-height: 1.35; }
+.fact-more { color: var(--ink-3); font-size: 13px; }
+.fact-share { font-family: var(--mono); font-size: 12.5px; color: var(--ink-3); margin-left: 6px; }
+.fact-wide { grid-column: span 2; }
+.fact-label { font-size: 12px; color: var(--ink-3); margin-bottom: 3px; }
+.fact-value {
+    font-family: var(--mono); font-size: 18px; font-weight: 500; color: var(--ink);
+    font-variant-numeric: tabular-nums; letter-spacing: -0.01em; line-height: 1.25;
+}
+.fact-note { font-size: 11.5px; line-height: 1.45; color: var(--ink-3); margin-top: 4px; }
+.foot-note { font-family: var(--sans, inherit); font-size: 11.5px; color: var(--ink-3); letter-spacing: 0; }
+@media (max-width: 640px) { .fact-wide { grid-column: auto; } }
 
 /* ---------- notices ---------- */
 .notice { border-radius: 0 6px 6px 0; padding: 13px 16px; font-size: 13.5px;
@@ -2048,6 +2244,15 @@ table.data-table th {
     white-space: normal; line-height: 1.3;
 }
 table.data-table th.c-num { text-align: right; }
+table.sortable th[data-sort] { cursor: pointer; user-select: none; }
+table.sortable th[data-sort]:hover { color: var(--ink); }
+table.sortable th.sorted { color: var(--ink); }
+table.sortable th.sorted::after { content: " \\2191"; }
+table.sortable th.sorted.desc::after { content: " \\2193"; }
+.section-hint {
+    display: block; font-size: 12.5px; letter-spacing: 0; text-transform: none;
+    color: var(--ink-3); margin-top: 3px;
+}
 table.data-table th.c-rank { width: 38px; }
 table.data-table td {
     padding: 10px 12px; border-bottom: 1px solid var(--rule-soft);
@@ -2060,6 +2265,8 @@ table.data-table td.num {
     text-align: right; color: var(--ink); white-space: nowrap;
 }
 table.data-table td.num.strong { font-weight: 500; }
+table.data-table td.num.index { color: var(--cool); font-weight: 500; }
+table.data-table th.index { color: var(--cool); }
 table.data-table td.rank { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
 table.data-table td.title { color: var(--ink); }
 table.data-table td.title a {
